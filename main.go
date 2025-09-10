@@ -466,6 +466,8 @@ func startKeepAlive() {
 	}()
 }
 
+startKeepAlive()
+
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 	log.Println("--- 🔥 Hot Wheels Hunter Started (Variation-Aware API Version) 🔥 ---")
