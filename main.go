@@ -427,6 +427,47 @@ func commandListenerWorker(stop chan struct{}) {
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 	log.Println("--- 🔥 Hot Wheels Hunter Started (Variation-Aware API Version) 🔥 ---")
+
+	// Add HTTP server for Render deployment
+	go func() {
+		port := os.Getenv("PORT")
+		if port == "" {
+			port = "8080"
+		}
+		
+		http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte("Hot Wheels Hunter is running!"))
+		})
+		
+		http.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
+			mutex.Lock()
+			status := "running"
+			if isPaused {
+				status = "paused"
+			}
+			interval := checkInterval
+			itemCount := len(seenItems)
+			mutex.Unlock()
+			
+			response := fmt.Sprintf(`{
+				"status": "%s",
+				"check_interval_seconds": %.0f,
+				"tracked_items": %d,
+				"uptime": "running"
+			}`, status, interval.Seconds(), itemCount)
+			
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(response))
+		})
+		
+		log.Printf("HTTP server starting on port %s", port)
+		if err := http.ListenAndServe(":"+port, nil); err != nil {
+			log.Printf("HTTP server error: %v", err)
+		}
+	}()
+	
 	if _, err := os.Stat(SEEN_ITEMS_FILE); os.IsNotExist(err) {
 		initializeBaseline()
 	}
