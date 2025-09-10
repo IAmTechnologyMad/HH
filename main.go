@@ -424,26 +424,37 @@ func commandListenerWorker(stop chan struct{}) {
 	}
 }
 
-func startKeepAlive(appURL string) {
-	if appURL == "" {
-		log.Println("⚠️ No RENDER_EXTERNAL_URL provided, keep-alive disabled")
-		return
-	}
+// Replace your startKeepAlive function with this version:
+
+func startKeepAlive() {
+	// Your specific Render URL
+	appURL := "https://hh-mvnn.onrender.com"
 	
 	go func() {
 		// Wait 2 minutes before starting keep-alive (let the app fully start)
+		log.Println("⏰ Keep-alive will start in 2 minutes...")
 		time.Sleep(2 * time.Minute)
 		
-		ticker := time.NewTicker(10 * time.Minute) // Ping every 10 minutes
+		ticker := time.NewTicker(8 * time.Minute) // Ping every 8 minutes
 		defer ticker.Stop()
 		
 		log.Printf("🔄 Keep-alive service started, pinging: %s", appURL)
 		
+		client := &http.Client{Timeout: 30 * time.Second}
+		
+		// Do an immediate first ping
+		resp, err := client.Get(appURL + "/ping")
+		if err != nil {
+			log.Printf("⚠️ Initial keep-alive ping failed: %v", err)
+		} else {
+			resp.Body.Close()
+			log.Printf("✅ Initial keep-alive ping successful (status: %d)", resp.StatusCode)
+		}
+		
 		for {
 			select {
 			case <-ticker.C:
-				client := &http.Client{Timeout: 30 * time.Second}
-				resp, err := client.Get(appURL + "/status")
+				resp, err := client.Get(appURL + "/ping")
 				if err != nil {
 					log.Printf("⚠️ Keep-alive ping failed: %v", err)
 				} else {
