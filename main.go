@@ -24,7 +24,7 @@ const (
 	PAGES_TO_SCAN           = 6 // Total pages to check (1 initial + 9 paging)
 	TELEGRAM_BOT_TOKEN      = "8336369415:AAE7idSEyOpMIUlYhL4z9yze0C4_6rdbzE4"
 	TELEGRAM_CHAT_ID        = "-4985438208"
-	ADMIN_CHAT_ID           = "7020919908"
+	ADMIN_CHAT_ID           = "837428747"
 	SEEN_ITEMS_FILE         = "seen_hotwheels_go.txt"
 )
 
