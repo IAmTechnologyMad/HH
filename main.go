@@ -127,6 +127,46 @@ func saveNewItem(productInfoID string) {
 	}
 }
 
+func startKeepAlive() {
+	// Your specific Render URL
+	appURL := "https://hh-mvnn.onrender.com"
+	
+	go func() {
+		// Wait 2 minutes before starting keep-alive (let the app fully start)
+		log.Println("⏰ Keep-alive will start in 2 minutes...")
+		time.Sleep(2 * time.Minute)
+		
+		ticker := time.NewTicker(8 * time.Minute) // Ping every 8 minutes
+		defer ticker.Stop()
+		
+		log.Printf("🔄 Keep-alive service started, pinging: %s", appURL)
+		
+		client := &http.Client{Timeout: 30 * time.Second}
+		
+		// Do an immediate first ping
+		resp, err := client.Get(appURL + "/ping")
+		if err != nil {
+			log.Printf("⚠️ Initial keep-alive ping failed: %v", err)
+		} else {
+			resp.Body.Close()
+			log.Printf("✅ Initial keep-alive ping successful (status: %d)", resp.StatusCode)
+		}
+		
+		for {
+			select {
+			case <-ticker.C:
+				resp, err := client.Get(appURL + "/ping")
+				if err != nil {
+					log.Printf("⚠️ Keep-alive ping failed: %v", err)
+				} else {
+					resp.Body.Close()
+					log.Printf("✅ Keep-alive ping successful (status: %d)", resp.StatusCode)
+				}
+			}
+		}
+	}()
+}
+
 // --- CORE API LOGIC (No changes here) ---
 func fetchAndParseAPI(apiURL string) ([]Product, error) {
 	client := &http.Client{Timeout: 15 * time.Second}
@@ -424,50 +464,6 @@ func commandListenerWorker(stop chan struct{}) {
 	}
 }
 
-// Replace your startKeepAlive function with this version:
-
-func startKeepAlive() {
-	// Your specific Render URL
-	appURL := "https://hh-mvnn.onrender.com"
-	
-	go func() {
-		// Wait 2 minutes before starting keep-alive (let the app fully start)
-		log.Println("⏰ Keep-alive will start in 2 minutes...")
-		time.Sleep(2 * time.Minute)
-		
-		ticker := time.NewTicker(8 * time.Minute) // Ping every 8 minutes
-		defer ticker.Stop()
-		
-		log.Printf("🔄 Keep-alive service started, pinging: %s", appURL)
-		
-		client := &http.Client{Timeout: 30 * time.Second}
-		
-		// Do an immediate first ping
-		resp, err := client.Get(appURL + "/ping")
-		if err != nil {
-			log.Printf("⚠️ Initial keep-alive ping failed: %v", err)
-		} else {
-			resp.Body.Close()
-			log.Printf("✅ Initial keep-alive ping successful (status: %d)", resp.StatusCode)
-		}
-		
-		for {
-			select {
-			case <-ticker.C:
-				resp, err := client.Get(appURL + "/ping")
-				if err != nil {
-					log.Printf("⚠️ Keep-alive ping failed: %v", err)
-				} else {
-					resp.Body.Close()
-					log.Printf("✅ Keep-alive ping successful (status: %d)", resp.StatusCode)
-				}
-			}
-		}
-	}()
-}
-
-startKeepAlive()
-
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 	log.Println("--- 🔥 Hot Wheels Hunter Started (Variation-Aware API Version) 🔥 ---")
@@ -481,7 +477,7 @@ func main() {
 		
 		http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusOK)
-			w.Write([]byte("Hot Wheels Hunter is running!"))
+			w.Write([]byte("🔥 Hot Wheels Hunter is running! 🔥"))
 		})
 		
 		http.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
@@ -498,19 +494,28 @@ func main() {
 				"status": "%s",
 				"check_interval_seconds": %.0f,
 				"tracked_items": %d,
-				"uptime": "running"
-			}`, status, interval.Seconds(), itemCount)
+				"bot": "Hot Wheels Hunter",
+				"timestamp": "%s"
+			}`, status, interval.Seconds(), itemCount, time.Now().Format("2006-01-02 15:04:05"))
 			
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
 			w.Write([]byte(response))
 		})
 		
-		log.Printf("HTTP server starting on port %s", port)
+		http.HandleFunc("/ping", func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte("pong"))
+		})
+		
+		log.Printf("🌐 HTTP server starting on port %s", port)
 		if err := http.ListenAndServe(":"+port, nil); err != nil {
-			log.Printf("HTTP server error: %v", err)
+			log.Printf("❌ HTTP server error: %v", err)
 		}
 	}()
+	
+	// Start keep-alive service
+	startKeepAlive()
 	
 	if _, err := os.Stat(SEEN_ITEMS_FILE); os.IsNotExist(err) {
 		initializeBaseline()
