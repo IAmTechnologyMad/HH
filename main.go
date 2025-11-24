@@ -169,7 +169,7 @@ func startKeepAlive() {
 
 // --- CORE API LOGIC (No changes here) ---
 func fetchAndParseAPI(apiURL string) ([]Product, error) {
-	client := &http.Client{Timeout: 15 * time.Second}
+	client := &http.Client{Timeout: 6 * time.Second}
 	req, err := http.NewRequest("GET", apiURL, nil)
 	if err != nil {
 		return nil, err
@@ -214,38 +214,58 @@ func fetchAndParseAPI(apiURL string) ([]Product, error) {
 
 func getAllProductsFromAPI() ([]Product, error) {
 	var allProducts []Product
+	var mu sync.Mutex
+	var wg sync.WaitGroup
 	var seenPInfIDs = make(map[string]bool) // Use PInfId to track duplicates during the scan
 
-	log.Println("... Fetching Page 1 with special API call (PageSize=100)...")
-	page1Products, err := fetchAndParseAPI(API_URL_PAGE_1)
-	if err != nil {
-		log.Printf("❌ CRITICAL: Failed to fetch Page 1, results may be incomplete: %v", err)
-	} else {
+	log.Println("... Fetching all pages in parallel...")
+	
+	// Fetch Page 1 in parallel
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		page1Products, err := fetchAndParseAPI(API_URL_PAGE_1)
+		if err != nil {
+			log.Printf("❌ CRITICAL: Failed to fetch Page 1, results may be incomplete: %v", err)
+			return
+		}
+		mu.Lock()
 		for _, p := range page1Products {
 			if !seenPInfIDs[p.ProductInfoID] {
 				allProducts = append(allProducts, p)
 				seenPInfIDs[p.ProductInfoID] = true
 			}
 		}
-	}
+		mu.Unlock()
+	}()
 
+	// Fetch Pages 2-6 in parallel
 	for i := 2; i <= PAGES_TO_SCAN; i++ {
-		pagingURL := fmt.Sprintf(API_URL_PAGING_TEMPLATE, i)
-		products, err := fetchAndParseAPI(pagingURL)
-		if err != nil {
-			log.Printf("❌ Error fetching API page %d: %v", i, err)
-			continue
-		}
-		if len(products) == 0 {
-			break
-		}
-		for _, p := range products {
-			if !seenPInfIDs[p.ProductInfoID] {
-				allProducts = append(allProducts, p)
-				seenPInfIDs[p.ProductInfoID] = true
+		wg.Add(1)
+		go func(pageNum int) {
+			defer wg.Done()
+			pagingURL := fmt.Sprintf(API_URL_PAGING_TEMPLATE, pageNum)
+			products, err := fetchAndParseAPI(pagingURL)
+			if err != nil {
+				log.Printf("❌ Error fetching API page %d: %v", pageNum, err)
+				return
 			}
-		}
+			if len(products) == 0 {
+				return
+			}
+			mu.Lock()
+			for _, p := range products {
+				if !seenPInfIDs[p.ProductInfoID] {
+					allProducts = append(allProducts, p)
+					seenPInfIDs[p.ProductInfoID] = true
+				}
+			}
+			mu.Unlock()
+		}(i)
 	}
+	
+	wg.Wait()
+	log.Printf("... Parallel fetch complete, found %d unique products", len(allProducts))
 	return allProducts, nil
 }
 
@@ -324,13 +344,28 @@ func scraperWorker(stop chan struct{}) {
 		log.Println("...No new items found.")
 		sendTelegramMessage(TELEGRAM_CHAT_ID, "✅ No new listings found on initial check.")
 	}
+	// Use ticker for consistent intervals
+	mutex.Lock()
+	interval := checkInterval
+	mutex.Unlock()
+	
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	
 	for {
-		mutex.Lock()
-		interval := checkInterval
-		paused := isPaused
-		mutex.Unlock()
 		select {
-		case <-time.After(interval):
+		case <-ticker.C:
+			mutex.Lock()
+			paused := isPaused
+			currentInterval := checkInterval
+			mutex.Unlock()
+			
+			// Update ticker if interval changed
+			if currentInterval != interval {
+				interval = currentInterval
+				ticker.Reset(interval)
+			}
+			
 			if !paused {
 				newlyFoundProducts := checkForNewItems()
 				mutex.Lock()
@@ -339,12 +374,11 @@ func scraperWorker(stop chan struct{}) {
 					checkHistory = checkHistory[1:]
 				}
 				isMuted := heartbeatMuted
-				currentInterval := checkInterval
 				mutex.Unlock()
 				if len(newlyFoundProducts) == 0 {
 					log.Println("...No new items found.")
 					if !isMuted {
-						sendTelegramMessage(TELEGRAM_CHAT_ID, fmt.Sprintf("✅ No new listings found. Next check in ~%.0f seconds.", currentInterval.Seconds()))
+						sendTelegramMessage(TELEGRAM_CHAT_ID, fmt.Sprintf("✅ No new listings found. Next check in ~%.0f seconds.", interval.Seconds()))
 					}
 				}
 			} else {
