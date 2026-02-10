@@ -13,6 +13,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/gorilla/websocket"
 )
 
 // --- CONFIGURATION ---
@@ -36,7 +38,65 @@ var (
 	heartbeatMuted = false
 	seenItems      = make(map[string]bool) // The KEY will now be the ProductInfoID
 	checkHistory   []CheckResult
+	// WebSocket variables
+	broadcast = make(chan Product)
+	upgrader  = websocket.Upgrader{
+		CheckOrigin: func(r *http.Request) bool {
+			return true // Allow all origins for now
+		},
+	}
+	clients   = make(map[*websocket.Conn]bool) // Connected clients
+	clientsMu sync.Mutex
 )
+
+// --- WEBSOCKET HANDLER ---
+func handleWebSocket(w http.ResponseWriter, r *http.Request) {
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Printf("WebSocket upgrade failed: %v", err)
+		return
+	}
+	defer conn.Close()
+
+	clientsMu.Lock()
+	clients[conn] = true
+	clientsMu.Unlock()
+
+	log.Printf("New WebSocket client connected: %s", conn.RemoteAddr())
+
+	// Send a welcome message or current status
+	welcomeMsg := map[string]string{"status": "connected", "message": "Welcome to Hot Wheels Hunter Real-Time Feed"}
+	conn.WriteJSON(welcomeMsg)
+
+	// Keep connection alive/listen for close
+	for {
+		_, _, err := conn.ReadMessage()
+		if err != nil {
+			clientsMu.Lock()
+			delete(clients, conn)
+			clientsMu.Unlock()
+			log.Printf("WebSocket client disconnected: %s", conn.RemoteAddr())
+			break
+		}
+	}
+}
+
+// --- BROADCAST LISTENER ---
+func handleMessages() {
+	for {
+		product := <-broadcast
+		clientsMu.Lock()
+		for client := range clients {
+			err := client.WriteJSON(product)
+			if err != nil {
+				log.Printf("WebSocket write error: %v", err)
+				client.Close()
+				delete(clients, client)
+			}
+		}
+		clientsMu.Unlock()
+	}
+}
 
 // --- TELEGRAM STRUCTS ---
 type TelegramUpdateResponse struct {
@@ -330,6 +390,11 @@ func checkForNewItems() []Product {
 			mutex.Lock()
 			seenItems[uniqueID] = true
 			mutex.Unlock()
+
+			// Broadcast to WebSockets
+			go func(prod Product) {
+				broadcast <- prod
+			}(p)
 		}
 	}
 	return newProductsFound
@@ -446,7 +511,7 @@ func commandListenerWorker(stop chan struct{}) {
 			case "/setinterval":
 				if len(parts) > 1 {
 					i, err := strconv.Atoi(parts[1])
-					if err == nil && i >= 10 {
+					if err == nil && i >= 1 { // Changed min interval to 1 second
 						mutex.Lock()
 						checkInterval = time.Duration(i) * time.Second
 						mutex.Unlock()
@@ -541,6 +606,22 @@ func main() {
 			w.WriteHeader(http.StatusOK)
 			w.Write([]byte("pong"))
 		})
+
+		// WebSocket Endpoint
+		http.HandleFunc("/ws", handleWebSocket)
+		
+		// Test Broadcast Endpoint
+		http.HandleFunc("/test-broadcast", func(w http.ResponseWriter, r *http.Request) {
+			testProduct := Product{
+				ProductID:     "TEST-123",
+				ProductInfoID: "TEST-INFO-123",
+				ProductName:   "TEST ALERT: Hot Wheels Premium (Simulation)",
+				Price:         "999",
+				StockStatus:   "1",
+			}
+			go func() { broadcast <- testProduct }()
+			w.Write([]byte("Test broadcast sent!"))
+		})
 		
 		log.Printf("🌐 HTTP server starting on port %s", port)
 		if err := http.ListenAndServe(":"+port, nil); err != nil {
@@ -559,6 +640,7 @@ func main() {
 	stop := make(chan struct{})
 	go scraperWorker(stop)
 	go commandListenerWorker(stop)
+	go handleMessages() // Start broadcast listener
 	sendTelegramMessage(ADMIN_CHAT_ID, "🚀 Bot is online and running!")
 	<-stop
 	log.Println("--- Bot has been shut down. ---")
