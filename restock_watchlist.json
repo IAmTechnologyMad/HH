@@ -1,0 +1,42 @@
+{
+    "enabled": true,
+    "poll_interval_seconds": 5,
+    "products": [
+        {
+            "product_id": "22115543",
+            "name": "Hot Wheels McLaren Formula 1 Team 4 Formula One Premium Die Cast Car",
+            "url": "https://www.firstcry.com/hot-wheels/hot-wheels-mclaren-formula-1-team-4-formula-one-premium-die-cast-car-anthracite-black-and-yellow/22115543/product-detail",
+            "last_stock": "0"
+        },
+        {
+            "product_id": "21945058",
+            "name": "Hot Wheels Die Cast Free Wheel McLaren W1 142/250 Toy Car",
+            "url": "https://www.firstcry.com/hot-wheels/hot-wheels-die-cast-free-wheel-mclaren-w1-142-250-toy-car-charcoal-grey/21945058/product-detail",
+            "last_stock": "0"
+        },
+        {
+            "product_id": "21947648",
+            "name": "Hot Wheels Die Cast Free Wheel Porsche 911 Carrera T 15/250 Toy Car",
+            "url": "https://www.firstcry.com/hot-wheels/hot-wheels-die-cast-free-wheel-porsche-911-carrera-t-15-250-toy-car-off-white/21947648/product-detail",
+            "last_stock": "0"
+        },
+        {
+            "product_id": "22157119",
+            "name": "Hot Wheels Premium 2025 Mercedes AMG Petronas F1 Team Car",
+            "url": "https://www.firstcry.com/hot-wheels/hot-wheels-premium-2025-mercedes-amg-petronas-f1-team-car-black-and-green/22157119/product-detail",
+            "last_stock": "0"
+        },
+        {
+            "product_id": "22157138",
+            "name": "Hot Wheels Premium 2025 Visa Cash App Racing Bulls F1 Team Car",
+            "url": "https://www.firstcry.com/hot-wheels/hot-wheels-premium-2025-visa-cash-app-racing-bulls-f1-team-car-black-and-white/22157138/product-detail",
+            "last_stock": "0"
+        },
+        {
+            "product_id": "22157195",
+            "name": "Hot Wheels Premium MoneyGram Haas F1 Team 31 Die Cast Car",
+            "url": "https://www.firstcry.com/hot-wheels/hot-wheels-premium-moneygram-haas-f1-team-31-die-cast-car-white-and-black/22157195/product-detail",
+            "last_stock": "0"
+        }
+    ]
+}

@@ -33,23 +33,27 @@ const (
 	// PAGING: Pages 2+
 	API_URL_PAGING_TEMPLATE = "https://www.firstcry.com/svcs/SearchResult.svc/GetSearchResultProductsPaging?PageNo=%d&PageSize=20&SortExpression=NewArrivals&OnSale=5&SearchString=brand&SubCatId=&BrandId=&Price=&Age=&Color=&OptionalFilter=&OutOfStock=&Type1=&Type2=&Type3=&Type4=&Type5=&Type6=&Type7=&Type8=&Type9=&Type10=&Type11=&Type12=&Type13=&Type14=&Type15=&combo=&discount=&searchwithincat=&ProductidQstr=&searchrank=&pmonths=&cgen=&PriceQstr=&DiscountQstr=&sorting=&MasterBrand=113&Rating=&Offer=&skills=&material=&curatedcollections=&measurement=&gender=&exclude=&premium=&pcode=680566&isclub=0&deliverytype="
 
-	PAGES_TO_SCAN      = 6
-	TELEGRAM_BOT_TOKEN = "8336369415:AAE7idSEyOpMIUlYhL4z9yze0C4_6rdbzE4"
-	TELEGRAM_CHAT_ID   = "-4985438208"
-	ADMIN_CHAT_ID      = "837428747"
-	SEEN_ITEMS_FILE    = "seen_hotwheels_go.txt"
-	CART_CONFIG_FILE   = "cart_config.json"
+	PAGES_TO_SCAN          = 6
+	TELEGRAM_BOT_TOKEN     = "8336369415:AAE7idSEyOpMIUlYhL4z9yze0C4_6rdbzE4"
+	TELEGRAM_CHAT_ID       = "-4985438208"
+	ADMIN_CHAT_ID          = "837428747"
+	SEEN_ITEMS_FILE        = "seen_hotwheels_go.txt"
+	CART_CONFIG_FILE       = "cart_config.json"
+	RESTOCK_WATCHLIST_FILE = "restock_watchlist.json"
 
 	// --- CART API ---
 	CART_API_URL  = "https://www.firstcry.com/svcs/CommonService.svc/SaveCartDetail"
 	CART_SAVE_URL = "https://www.firstcry.com/capinet/pdp/SaveProductCart"
 
 	// --- SPEED TUNING ---
-	ULTRA_FAST_INTERVAL = 3 * time.Second  // Tiny 5-item check every 3 seconds
-	FAST_POLL_INTERVAL  = 10 * time.Second // 20-item check every 10 seconds (alternates with ultra)
-	FULL_SCAN_INTERVAL  = 90 * time.Second // Full 6-page scan every 90 seconds
-	HTTP_TIMEOUT        = 4 * time.Second
-	TELEGRAM_TIMEOUT    = 5 * time.Second
+	ULTRA_FAST_INTERVAL   = 3 * time.Second  // Tiny 5-item check every 3 seconds
+	FAST_POLL_INTERVAL    = 10 * time.Second // 20-item check every 10 seconds (alternates with ultra)
+	FULL_SCAN_INTERVAL    = 90 * time.Second // Full 6-page scan every 90 seconds
+	RESTOCK_POLL_INTERVAL = 5 * time.Second  // Restock watchlist poll every 5 seconds
+	HTTP_TIMEOUT          = 4 * time.Second
+	TELEGRAM_TIMEOUT      = 30 * time.Second
+	CART_TIMEOUT          = 15 * time.Second // Generous timeout for cart — this MUST succeed
+	CART_MAX_RETRIES      = 3                // Retry up to 3 times
 )
 
 // --- PERSISTENT HTTP CLIENTS (connection reuse) ---
@@ -74,6 +78,18 @@ var (
 			MaxIdleConnsPerHost: 3,
 			IdleConnTimeout:     120 * time.Second,
 			TLSHandshakeTimeout: 3 * time.Second,
+			ForceAttemptHTTP2:   true,
+		},
+	}
+
+	// Dedicated cart client — longer timeout, this is the most important request
+	cartClient = &http.Client{
+		Timeout: CART_TIMEOUT,
+		Transport: &http.Transport{
+			MaxIdleConns:        10,
+			MaxIdleConnsPerHost: 5,
+			IdleConnTimeout:     120 * time.Second,
+			TLSHandshakeTimeout: 5 * time.Second,
 			ForceAttemptHTTP2:   true,
 		},
 	}
@@ -110,6 +126,10 @@ var (
 	// Cart config
 	cartConfig   CartConfig
 	cartConfigMu sync.RWMutex
+
+	// Restock watchlist
+	restockWatchlist   RestockWatchlist
+	restockWatchlistMu sync.RWMutex
 )
 
 // --- CART CONFIG ---
@@ -117,6 +137,20 @@ type CartConfig struct {
 	Enabled bool   `json:"enabled"`
 	Cookies string `json:"cookies"`
 	Ftk     string `json:"ftk"`
+}
+
+// --- RESTOCK WATCHLIST ---
+type WatchProduct struct {
+	ProductID string `json:"product_id"`
+	Name      string `json:"name"`
+	URL       string `json:"url"`
+	LastStock string `json:"last_stock"` // "0" = out of stock
+}
+
+type RestockWatchlist struct {
+	Enabled          bool           `json:"enabled"`
+	PollIntervalSecs int            `json:"poll_interval_seconds"`
+	Products         []WatchProduct `json:"products"`
 }
 
 func loadCartConfig() {
@@ -145,7 +179,66 @@ func saveCartConfig() {
 	os.WriteFile(CART_CONFIG_FILE, data, 0644)
 }
 
-// --- ADD TO CART (fires instantly, ~200ms) ---
+func loadRestockWatchlist() {
+	data, err := os.ReadFile(RESTOCK_WATCHLIST_FILE)
+	if err != nil {
+		log.Printf("⚠️ No restock watchlist found (%s) — restock monitor disabled", RESTOCK_WATCHLIST_FILE)
+		return
+	}
+	restockWatchlistMu.Lock()
+	defer restockWatchlistMu.Unlock()
+	if err := json.Unmarshal(data, &restockWatchlist); err != nil {
+		log.Printf("❌ Restock watchlist parse error: %v", err)
+		return
+	}
+	if restockWatchlist.PollIntervalSecs < 1 {
+		restockWatchlist.PollIntervalSecs = 5
+	}
+	if restockWatchlist.Enabled {
+		log.Printf("👁️ Restock watchlist: ENABLED (%d products, every %ds)", len(restockWatchlist.Products), restockWatchlist.PollIntervalSecs)
+	} else {
+		log.Println("👁️ Restock watchlist: DISABLED")
+	}
+}
+
+func saveRestockWatchlist() {
+	restockWatchlistMu.RLock()
+	data, _ := json.MarshalIndent(restockWatchlist, "", "    ")
+	restockWatchlistMu.RUnlock()
+	os.WriteFile(RESTOCK_WATCHLIST_FILE, data, 0644)
+}
+
+// Extract product ID from a FirstCry URL like:
+// https://www.firstcry.com/hot-wheels/some-name/15837901/product-detail
+func extractProductIDFromURL(rawURL string) string {
+	rawURL = strings.TrimSpace(rawURL)
+	// Try to find a numeric segment that looks like a product ID
+	parts := strings.Split(rawURL, "/")
+	for _, part := range parts {
+		if len(part) >= 5 && len(part) <= 15 {
+			if _, err := strconv.Atoi(part); err == nil {
+				return part
+			}
+		}
+	}
+	return ""
+}
+
+// Extract product name from FirstCry URL slug
+func extractNameFromURL(rawURL string) string {
+	parts := strings.Split(rawURL, "/")
+	for i, part := range parts {
+		// The slug is typically right before the product ID
+		if i+1 < len(parts) {
+			if _, err := strconv.Atoi(parts[i+1]); err == nil && len(parts[i+1]) >= 5 {
+				return strings.ReplaceAll(part, "-", " ")
+			}
+		}
+	}
+	return "Unknown Product"
+}
+
+// --- ADD TO CART (BULLETPROOF — retries + validation + fallback) ---
 func addToCart(p Product) {
 	cartConfigMu.RLock()
 	if !cartConfig.Enabled || cartConfig.Ftk == "" || cartConfig.Cookies == "" {
@@ -157,66 +250,124 @@ func addToCart(p Product) {
 	cookies := cartConfig.Cookies
 	cartConfigMu.RUnlock()
 
-	start := time.Now()
+	fullURL := constructFullURL(p)
+	overallStart := time.Now()
 
-	// Request 1: SaveCartDetail (primary add-to-cart)
-	payload1 := fmt.Sprintf(`{"ftk":%q,"viewid":"","productid":%q,"quantity":"1","offertype":"NO","offerid":"","action":"add","gcoffer":""}`, ftk, p.ProductID)
+	// --- ATTEMPT PRIMARY API (SaveCartDetail) WITH RETRIES ---
+	var lastErr error
+	var lastStatus int
+	var lastBody string
+	success := false
 
-	req1, err := http.NewRequest("POST", CART_API_URL, bytes.NewBufferString(payload1))
-	if err != nil {
-		log.Printf("❌ Cart req1 build error: %v", err)
-		return
+	for attempt := 1; attempt <= CART_MAX_RETRIES; attempt++ {
+		if attempt > 1 {
+			// Exponential backoff: 500ms, 1s, 2s
+			backoff := time.Duration(1<<(attempt-2)) * 500 * time.Millisecond
+			log.Printf("🔄 Cart retry %d/%d in %v for: %s", attempt, CART_MAX_RETRIES, backoff, p.ProductName)
+			time.Sleep(backoff)
+		}
+
+		payload := fmt.Sprintf(`{"ftk":%q,"viewid":"","productid":%q,"quantity":"1","offertype":"NO","offerid":"","action":"add","gcoffer":""}`, ftk, p.ProductID)
+
+		req, err := http.NewRequest("POST", CART_API_URL, bytes.NewBufferString(payload))
+		if err != nil {
+			lastErr = fmt.Errorf("build request: %v", err)
+			continue
+		}
+		req.Header.Set("Content-Type", "application/json; charset=utf-8")
+		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+		req.Header.Set("Accept", "application/json, text/javascript, */*; q=0.01")
+		req.Header.Set("X-Requested-With", "XMLHttpRequest")
+		req.Header.Set("Origin", "https://www.firstcry.com")
+		req.Header.Set("Referer", "https://www.firstcry.com/")
+		req.Header.Set("Cookie", cookies)
+
+		resp, err := cartClient.Do(req)
+		if err != nil {
+			lastErr = fmt.Errorf("network: %v", err)
+			log.Printf("❌ Cart attempt %d failed (network): %v", attempt, err)
+			continue
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		lastStatus = resp.StatusCode
+		lastBody = string(body)
+
+		if resp.StatusCode == 200 {
+			// Validate response body — check it's not an error page or auth failure
+			bodyStr := strings.ToLower(lastBody)
+			if strings.Contains(bodyStr, "login") || strings.Contains(bodyStr, "session") || strings.Contains(bodyStr, "unauthorized") {
+				lastErr = fmt.Errorf("auth expired (response contains login/session)")
+				log.Printf("⚠️ Cart attempt %d: HTTP 200 but auth seems expired: %.100s", attempt, lastBody)
+				// Auth expired — no point retrying with same cookies
+				sendTelegramUrgent(ADMIN_CHAT_ID, fmt.Sprintf(
+					"🔑❌ <b>Cart cookies/FTK EXPIRED!</b>\n\nCannot add: %s\nUse /updatecookies and /updateftk to refresh.\n\n<a href='%s'>🛒 Add Manually →</a>",
+					p.ProductName, fullURL,
+				))
+				break
+			}
+			// SUCCESS!
+			success = true
+			break
+		} else if resp.StatusCode >= 500 {
+			// Server error — retry
+			lastErr = fmt.Errorf("HTTP %d", resp.StatusCode)
+			log.Printf("⚠️ Cart attempt %d: server error %d, will retry...", attempt, resp.StatusCode)
+			continue
+		} else {
+			// 4xx or other — likely won't help to retry
+			lastErr = fmt.Errorf("HTTP %d: %s", resp.StatusCode, lastBody)
+			log.Printf("❌ Cart attempt %d: HTTP %d — %.200s", attempt, resp.StatusCode, lastBody)
+			break
+		}
 	}
-	req1.Header.Set("Content-Type", "application/json; charset=utf-8")
-	req1.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-	req1.Header.Set("Accept", "application/json, text/javascript, */*; q=0.01")
-	req1.Header.Set("X-Requested-With", "XMLHttpRequest")
-	req1.Header.Set("Origin", "https://www.firstcry.com")
-	req1.Header.Set("Referer", "https://www.firstcry.com/")
-	req1.Header.Set("Cookie", cookies)
 
-	resp1, err := apiClient.Do(req1)
-	if err != nil {
-		log.Printf("❌ Cart req1 failed: %v", err)
-		sendTelegramMessage(ADMIN_CHAT_ID, fmt.Sprintf("❌ Failed to add to cart: %s\nError: %v", p.ProductName, err))
-		return
-	}
-	body1, _ := io.ReadAll(resp1.Body)
-	resp1.Body.Close()
+	elapsed := time.Since(overallStart)
 
-	elapsed := time.Since(start)
-
-	if resp1.StatusCode == 200 {
+	if success {
 		log.Printf("🛒✅ ADDED TO CART in %dms: %s (PID: %s)", elapsed.Milliseconds(), p.ProductName, p.ProductID)
 		mutex.Lock()
 		totalCarted++
 		mutex.Unlock()
 		sendTelegramUrgent(TELEGRAM_CHAT_ID, fmt.Sprintf(
-			"🛒 <b>Auto-Added to Cart!</b>\n\n<b>Name:</b> %s\n<b>Price:</b> ₹%s\n⚡ Added in %dms",
-			p.ProductName, p.Price, elapsed.Milliseconds(),
+			"🛒✅ <b>Auto-Added to Cart!</b>\n\n<b>Name:</b> %s\n<b>Price:</b> ₹%s\n⚡ Added in %dms\n\n<a href='%s'>🔗 View Product</a>",
+			p.ProductName, p.Price, elapsed.Milliseconds(), fullURL,
 		))
 
-		// Request 2: SaveProductCart (secondary confirmation)
+		// Request 2: SaveProductCart (secondary confirmation) — also with retry
 		go func() {
-			payload2 := fmt.Sprintf(`{"objdd":{"ProductID":%q,"ViewID":"","ProductType":"product","cart":"cart","Discount":""},"ftk":%q}`, p.ProductID, ftk)
-			req2, _ := http.NewRequest("POST", CART_SAVE_URL, bytes.NewBufferString(payload2))
-			req2.Header.Set("Content-Type", "application/json; charset=utf-8")
-			req2.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-			req2.Header.Set("Accept", "application/json, text/javascript, */*; q=0.01")
-			req2.Header.Set("X-Requested-With", "XMLHttpRequest")
-			req2.Header.Set("Origin", "https://www.firstcry.com")
-			req2.Header.Set("Referer", "https://www.firstcry.com/")
-			req2.Header.Set("Cookie", cookies)
-			resp2, err := apiClient.Do(req2)
-			if err != nil {
-				log.Printf("⚠️ Cart save (secondary) failed: %v", err)
+			for r := 1; r <= 2; r++ {
+				payload2 := fmt.Sprintf(`{"objdd":{"ProductID":%q,"ViewID":"","ProductType":"product","cart":"cart","Discount":""},"ftk":%q}`, p.ProductID, ftk)
+				req2, _ := http.NewRequest("POST", CART_SAVE_URL, bytes.NewBufferString(payload2))
+				req2.Header.Set("Content-Type", "application/json; charset=utf-8")
+				req2.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+				req2.Header.Set("Accept", "application/json, text/javascript, */*; q=0.01")
+				req2.Header.Set("X-Requested-With", "XMLHttpRequest")
+				req2.Header.Set("Origin", "https://www.firstcry.com")
+				req2.Header.Set("Referer", "https://www.firstcry.com/")
+				req2.Header.Set("Cookie", cookies)
+				resp2, err := cartClient.Do(req2)
+				if err != nil {
+					log.Printf("⚠️ Cart save (secondary) attempt %d failed: %v", r, err)
+					time.Sleep(1 * time.Second)
+					continue
+				}
+				resp2.Body.Close()
+				log.Printf("🛒 Secondary cart save OK for: %s", p.ProductName)
 				return
 			}
-			resp2.Body.Close()
 		}()
 	} else {
-		log.Printf("❌ Cart req1 bad status %d: %s", resp1.StatusCode, string(body1))
-		sendTelegramMessage(ADMIN_CHAT_ID, fmt.Sprintf("❌ Cart add failed (HTTP %d): %s\nResponse: %s", resp1.StatusCode, p.ProductName, string(body1)))
+		// ALL RETRIES FAILED — send URGENT fallback with buy link
+		log.Printf("❌❌ ALL %d CART ATTEMPTS FAILED for: %s (last error: %v)", CART_MAX_RETRIES, p.ProductName, lastErr)
+		sendTelegramUrgent(TELEGRAM_CHAT_ID, fmt.Sprintf(
+			"🚨🛒 <b>CART FAILED — ADD MANUALLY!</b>\n\n<b>Name:</b> %s\n<b>Price:</b> ₹%s\n\n<b>Error:</b> %v (HTTP %d)\n\n👉 <a href='%s'>ADD TO CART MANUALLY →</a>",
+			p.ProductName, p.Price, lastErr, lastStatus, fullURL,
+		))
+		sendTelegramUrgent(ADMIN_CHAT_ID, fmt.Sprintf(
+			"❌ Cart failed after %d attempts: %s\nLast error: %v\nHTTP %d: %.300s",
+			CART_MAX_RETRIES, p.ProductName, lastErr, lastStatus, lastBody,
+		))
 	}
 }
 
@@ -679,6 +830,144 @@ func recordHistory(items []Product) {
 	mutex.Unlock()
 }
 
+// --- RESTOCK MONITOR: Polls specific products, INSTANT cart on restock ---
+func restockMonitorWorker(stop chan struct{}) {
+	restockWatchlistMu.RLock()
+	if !restockWatchlist.Enabled || len(restockWatchlist.Products) == 0 {
+		restockWatchlistMu.RUnlock()
+		log.Println("👁️ Restock monitor: nothing to watch, sleeping...")
+		// Still stay alive — watchlist can be updated via commands
+		for {
+			select {
+			case <-stop:
+				return
+			case <-time.After(10 * time.Second):
+				restockWatchlistMu.RLock()
+				hasProducts := restockWatchlist.Enabled && len(restockWatchlist.Products) > 0
+				restockWatchlistMu.RUnlock()
+				if hasProducts {
+					log.Println("👁️ Restock monitor: watchlist updated, starting monitoring...")
+					goto startMonitoring
+				}
+			}
+		}
+	}
+	restockWatchlistMu.RUnlock()
+
+startMonitoring:
+	log.Println("👁️ Restock monitor ACTIVE — watching for stock changes...")
+
+	restockWatchlistMu.RLock()
+	interval := time.Duration(restockWatchlist.PollIntervalSecs) * time.Second
+	if interval < 1*time.Second {
+		interval = RESTOCK_POLL_INTERVAL
+	}
+	restockWatchlistMu.RUnlock()
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-stop:
+			log.Println("👁️ Restock monitor shutting down.")
+			return
+		case <-ticker.C:
+			mutex.Lock()
+			paused := isPaused
+			mutex.Unlock()
+			if paused {
+				continue
+			}
+
+			restockWatchlistMu.RLock()
+			if !restockWatchlist.Enabled || len(restockWatchlist.Products) == 0 {
+				restockWatchlistMu.RUnlock()
+				continue
+			}
+			// Copy products to check
+			productsToCheck := make([]WatchProduct, len(restockWatchlist.Products))
+			copy(productsToCheck, restockWatchlist.Products)
+			restockWatchlistMu.RUnlock()
+
+			for _, wp := range productsToCheck {
+				go checkRestockAndCart(wp)
+			}
+		}
+	}
+}
+
+// Check a single product's stock and INSTANTLY add to cart if restocked
+func checkRestockAndCart(wp WatchProduct) {
+	start := time.Now()
+
+	// Use the search API with ProductidQstr to query this specific product
+	checkURL := fmt.Sprintf(
+		"https://www.firstcry.com/svcs/SearchResult.svc/GetSearchResultProductsFilters?PageNo=1&PageSize=1&SortExpression=NewArrivals&OnSale=5&SearchString=brand&SubCatId=&BrandId=&Price=&Age=&Color=&OptionalFilter=&OutOfStock=&Type1=&Type2=&Type3=&Type4=&Type5=&Type6=&Type7=&Type8=&Type9=&Type10=&Type11=&Type12=&Type13=&Type14=&Type15=&combo=&discount=&searchwithincat=&ProductidQstr=%s&searchrank=&pmonths=&cgen=&PriceQstr=&DiscountQstr=&MasterBrand=113&sorting=&Rating=&Offer=&skills=&material=&curatedcollections=&measurement=&gender=&exclude=&premium=&pcode=680566&isclub=0&deliverytype=",
+		wp.ProductID,
+	)
+
+	products, _, _, err := fetchAPI(checkURL)
+	if err != nil {
+		log.Printf("👁️ Restock check error for %s: %v", wp.Name, err)
+		return
+	}
+
+	elapsed := time.Since(start)
+
+	if len(products) == 0 {
+		log.Printf("👁️ Restock check: %s — not found in API (%dms)", wp.Name, elapsed.Milliseconds())
+		return
+	}
+
+	p := products[0]
+	currentStock := p.StockStatus
+
+	// RESTOCK DETECTED: was out of stock ("0"), now in stock!
+	if currentStock != "0" && (wp.LastStock == "0" || wp.LastStock == "") {
+		log.Printf("🚨🚨🚨 RESTOCK DETECTED: %s (stock: %s) — ADDING TO CART INSTANTLY!", wp.Name, currentStock)
+
+		// 🛒 CART FIRST — absolute priority, zero delay
+		go addToCart(p)
+
+		// 📢 Then notify
+		productURL := wp.URL
+		if productURL == "" {
+			productURL = constructFullURL(p)
+		}
+		sendTelegramUrgent(TELEGRAM_CHAT_ID, fmt.Sprintf(
+			"🚨🔥 <b>RESTOCKED! ADDING TO CART!</b>\n\n<b>Name:</b> %s\n<b>Price:</b> ₹%s\n<b>Stock:</b> %s\n⚡ Detected in %dms\n\n<a href='%s'>🛒 View/Buy →</a>",
+			p.ProductName, p.Price, currentStock, elapsed.Milliseconds(), productURL,
+		))
+
+		// Remove from watchlist after successful restock detection
+		restockWatchlistMu.Lock()
+		for i, rwp := range restockWatchlist.Products {
+			if rwp.ProductID == wp.ProductID {
+				restockWatchlist.Products = append(restockWatchlist.Products[:i], restockWatchlist.Products[i+1:]...)
+				break
+			}
+		}
+		restockWatchlistMu.Unlock()
+		saveRestockWatchlist()
+		log.Printf("👁️ Removed %s from watchlist (restocked!)", wp.Name)
+
+	} else if currentStock == "0" {
+		log.Printf("👁️ Still OOS: %s (%dms)", wp.Name, elapsed.Milliseconds())
+		// Update last known stock
+		restockWatchlistMu.Lock()
+		for i, rwp := range restockWatchlist.Products {
+			if rwp.ProductID == wp.ProductID {
+				restockWatchlist.Products[i].LastStock = currentStock
+				break
+			}
+		}
+		restockWatchlistMu.Unlock()
+	} else {
+		log.Printf("👁️ In stock: %s (stock: %s, %dms)", wp.Name, currentStock, elapsed.Milliseconds())
+	}
+}
+
 // --- TELEGRAM COMMAND LISTENER ---
 func commandListenerWorker(stop chan struct{}) {
 	log.Println("🤖 Command listener started.")
@@ -836,7 +1125,13 @@ func commandListenerWorker(stop chan struct{}) {
 					"/mute — Mute heartbeat messages\n"+
 					"/unmute — Enable heartbeat messages\n"+
 					"/recent — Show recent finds\n"+
-					"/stop — Shutdown bot")
+					"/stop — Shutdown bot\n\n"+
+					"<b>🔄 Restock Watchlist:</b>\n"+
+					"/watch URL — Watch product for restock\n"+
+					"/unwatch ID — Stop watching product\n"+
+					"/watchlist — Show watched products\n"+
+					"/restock_on — Enable restock monitor\n"+
+					"/restock_off — Disable restock monitor")
 
 			case "/cart_on":
 				cartConfigMu.Lock()
@@ -875,6 +1170,116 @@ func commandListenerWorker(stop chan struct{}) {
 				} else {
 					sendTelegramMessage(ADMIN_CHAT_ID, "Usage: /updateftk <token>")
 				}
+
+			case "/watch":
+				if len(parts) > 1 {
+					rawURL := parts[1]
+					pid := extractProductIDFromURL(rawURL)
+					if pid == "" {
+						// Maybe they just passed a product ID directly
+						if _, err := strconv.Atoi(rawURL); err == nil {
+							pid = rawURL
+						}
+					}
+					if pid == "" {
+						sendTelegramMessage(ADMIN_CHAT_ID, "❌ Could not extract product ID from URL.\nUsage: /watch <firstcry_product_url>")
+					} else {
+						name := extractNameFromURL(rawURL)
+						if len(parts) > 2 {
+							name = strings.Join(parts[2:], " ")
+						}
+						restockWatchlistMu.Lock()
+						// Check if already watching
+						alreadyWatching := false
+						for _, wp := range restockWatchlist.Products {
+							if wp.ProductID == pid {
+								alreadyWatching = true
+								break
+							}
+						}
+						if alreadyWatching {
+							restockWatchlistMu.Unlock()
+							sendTelegramMessage(ADMIN_CHAT_ID, fmt.Sprintf("⚠️ Already watching product %s", pid))
+						} else {
+							restockWatchlist.Products = append(restockWatchlist.Products, WatchProduct{
+								ProductID: pid,
+								Name:      name,
+								URL:       rawURL,
+								LastStock: "0",
+							})
+							restockWatchlist.Enabled = true
+							restockWatchlistMu.Unlock()
+							saveRestockWatchlist()
+							sendTelegramMessage(ADMIN_CHAT_ID, fmt.Sprintf("👁️ Now watching for restock:\n<b>%s</b>\nID: %s\n\nPolling every %ds", name, pid, restockWatchlist.PollIntervalSecs))
+						}
+					}
+				} else {
+					sendTelegramMessage(ADMIN_CHAT_ID, "Usage: /watch <firstcry_product_url> [optional name]")
+				}
+
+			case "/unwatch":
+				if len(parts) > 1 {
+					pid := parts[1]
+					// Also try extracting from URL
+					if extracted := extractProductIDFromURL(pid); extracted != "" {
+						pid = extracted
+					}
+					restockWatchlistMu.Lock()
+					found := false
+					for i, wp := range restockWatchlist.Products {
+						if wp.ProductID == pid {
+							restockWatchlist.Products = append(restockWatchlist.Products[:i], restockWatchlist.Products[i+1:]...)
+							found = true
+							break
+						}
+					}
+					restockWatchlistMu.Unlock()
+					if found {
+						saveRestockWatchlist()
+						sendTelegramMessage(ADMIN_CHAT_ID, fmt.Sprintf("✅ Stopped watching product %s", pid))
+					} else {
+						sendTelegramMessage(ADMIN_CHAT_ID, fmt.Sprintf("❌ Product %s not in watchlist", pid))
+					}
+				} else {
+					sendTelegramMessage(ADMIN_CHAT_ID, "Usage: /unwatch <product_id_or_url>")
+				}
+
+			case "/watchlist":
+				restockWatchlistMu.RLock()
+				if len(restockWatchlist.Products) == 0 {
+					restockWatchlistMu.RUnlock()
+					sendTelegramMessage(ADMIN_CHAT_ID, "👁️ Restock watchlist is empty.\nUse /watch <url> to add products.")
+				} else {
+					var sb strings.Builder
+					sb.WriteString(fmt.Sprintf("<b>👁️ Restock Watchlist</b> (%s)\n\n", map[bool]string{true: "✅ Active", false: "⏸ Disabled"}[restockWatchlist.Enabled]))
+					for i, wp := range restockWatchlist.Products {
+						stockEmoji := "🔴"
+						if wp.LastStock != "0" && wp.LastStock != "" {
+							stockEmoji = "🟢"
+						}
+						sb.WriteString(fmt.Sprintf("%d. %s <b>%s</b>\n   ID: %s\n", i+1, stockEmoji, wp.Name, wp.ProductID))
+						if wp.URL != "" {
+							sb.WriteString(fmt.Sprintf("   <a href='%s'>🔗 Link</a>\n", wp.URL))
+						}
+					}
+					sb.WriteString(fmt.Sprintf("\n⏱ Polling every %ds", restockWatchlist.PollIntervalSecs))
+					restockWatchlistMu.RUnlock()
+					sendTelegramMessage(ADMIN_CHAT_ID, sb.String())
+				}
+
+			case "/restock_on":
+				restockWatchlistMu.Lock()
+				restockWatchlist.Enabled = true
+				restockWatchlistMu.Unlock()
+				saveRestockWatchlist()
+				sendTelegramMessage(ADMIN_CHAT_ID, "👁️ Restock monitor ENABLED.")
+
+			case "/restock_off":
+				restockWatchlistMu.Lock()
+				restockWatchlist.Enabled = false
+				restockWatchlistMu.Unlock()
+				saveRestockWatchlist()
+				sendTelegramMessage(ADMIN_CHAT_ID, "👁️ Restock monitor DISABLED.")
 			}
 		}
 	}
@@ -1037,6 +1442,7 @@ func main() {
 
 	startKeepAlive()
 	loadCartConfig()
+	loadRestockWatchlist()
 
 	if _, err := os.Stat(SEEN_ITEMS_FILE); os.IsNotExist(err) {
 		initializeBaseline()
@@ -1047,10 +1453,19 @@ func main() {
 	stop := make(chan struct{})
 	go scraperWorker(stop)
 	go commandListenerWorker(stop)
+	go restockMonitorWorker(stop)
+
+	restockWatchlistMu.RLock()
+	restockStatus := "DISABLED"
+	restockCount := len(restockWatchlist.Products)
+	if restockWatchlist.Enabled && restockCount > 0 {
+		restockStatus = fmt.Sprintf("WATCHING %d products", restockCount)
+	}
+	restockWatchlistMu.RUnlock()
 
 	sendTelegramMessage(ADMIN_CHAT_ID, fmt.Sprintf(
-		"⚡ <b>Bot TURBO v2 Online!</b>\n\nUltra-fast: every %ds (5 items)\nFast: every 10s (20 items)\nFull scan: every %ds (all pages)\n\n🔥 ETag caching + content-hash dedup active",
-		int(ULTRA_FAST_INTERVAL.Seconds()), int(FULL_SCAN_INTERVAL.Seconds())))
+		"⚡ <b>Bot TURBO v2 Online!</b>\n\nUltra-fast: every %ds (5 items)\nFast: every 10s (20 items)\nFull scan: every %ds (all pages)\n👁️ Restock monitor: %s\n\n🔥 ETag caching + content-hash dedup active",
+		int(ULTRA_FAST_INTERVAL.Seconds()), int(FULL_SCAN_INTERVAL.Seconds()), restockStatus))
 
 	<-stop
 	log.Println("--- Bot shut down. ---")
