@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -45,52 +46,70 @@ const (
 	CART_API_URL  = "https://www.firstcry.com/svcs/CommonService.svc/SaveCartDetail"
 	CART_SAVE_URL = "https://www.firstcry.com/capinet/pdp/SaveProductCart"
 
-	// --- SPEED TUNING ---
-	ULTRA_FAST_INTERVAL   = 3 * time.Second  // Tiny 5-item check every 3 seconds
-	FAST_POLL_INTERVAL    = 10 * time.Second // 20-item check every 10 seconds (alternates with ultra)
-	FULL_SCAN_INTERVAL    = 90 * time.Second // Full 6-page scan every 90 seconds
-	RESTOCK_POLL_INTERVAL = 5 * time.Second  // Restock watchlist poll every 5 seconds
-	HTTP_TIMEOUT          = 4 * time.Second
-	TELEGRAM_TIMEOUT      = 30 * time.Second
-	CART_TIMEOUT          = 15 * time.Second // Generous timeout for cart — this MUST succeed
-	CART_MAX_RETRIES      = 3                // Retry up to 3 times
+	// --- SPEED TUNING (v3 — ULTRA AGGRESSIVE) ---
+	ULTRA_FAST_INTERVAL   = 2 * time.Second  // Tiny 5-item check every 2 seconds (was 3s)
+	FAST_POLL_INTERVAL    = 8 * time.Second  // 20-item check every 8 seconds (was 10s)
+	FULL_SCAN_INTERVAL    = 60 * time.Second // Full 6-page scan every 60 seconds (was 90s)
+	RESTOCK_POLL_INTERVAL = 3 * time.Second  // Restock watchlist poll every 3 seconds (was 5s)
+	HTTP_TIMEOUT          = 3 * time.Second  // Faster timeout (was 4s)
+	TELEGRAM_TIMEOUT      = 20 * time.Second // Faster Telegram timeout
+	CART_TIMEOUT          = 10 * time.Second // Cart timeout (was 15s) — must succeed but faster fail
+	CART_MAX_RETRIES      = 4                // Retry up to 4 times (was 3)
+	RESTOCK_MAX_CONCURRENT = 4               // Max concurrent restock checks
 )
 
-// --- PERSISTENT HTTP CLIENTS (connection reuse) ---
+// --- PERSISTENT HTTP CLIENTS (connection reuse + TCP keep-alive) ---
 var (
+	// Shared dialer with aggressive keep-alive for persistent connections
+	sharedDialer = &net.Dialer{
+		Timeout:   2 * time.Second,
+		KeepAlive: 30 * time.Second, // TCP-level keep-alive probes
+	}
+
 	apiClient = &http.Client{
 		Timeout: HTTP_TIMEOUT,
 		Transport: &http.Transport{
-			MaxIdleConns:        15,
-			MaxIdleConnsPerHost: 10,
-			IdleConnTimeout:     120 * time.Second,
-			TLSHandshakeTimeout: 3 * time.Second,
-			DisableCompression:  false,
-			// ForceAttemptHTTP2 ensures HTTP/2 is used when available
-			ForceAttemptHTTP2: true,
+			DialContext:           sharedDialer.DialContext,
+			MaxIdleConns:          30,
+			MaxIdleConnsPerHost:   20,
+			IdleConnTimeout:       180 * time.Second,
+			TLSHandshakeTimeout:   2 * time.Second,
+			ResponseHeaderTimeout: 3 * time.Second,
+			DisableCompression:    false,
+			ForceAttemptHTTP2:     true,
+			WriteBufferSize:       8192,
+			ReadBufferSize:        16384,
 		},
 	}
 
 	telegramClient = &http.Client{
 		Timeout: TELEGRAM_TIMEOUT,
 		Transport: &http.Transport{
-			MaxIdleConns:        5,
-			MaxIdleConnsPerHost: 3,
-			IdleConnTimeout:     120 * time.Second,
-			TLSHandshakeTimeout: 3 * time.Second,
-			ForceAttemptHTTP2:   true,
+			DialContext:           sharedDialer.DialContext,
+			MaxIdleConns:          10,
+			MaxIdleConnsPerHost:   5,
+			IdleConnTimeout:       180 * time.Second,
+			TLSHandshakeTimeout:   2 * time.Second,
+			ResponseHeaderTimeout: 10 * time.Second,
+			ForceAttemptHTTP2:     true,
+			WriteBufferSize:       4096,
+			ReadBufferSize:        4096,
 		},
 	}
 
-	// Dedicated cart client — longer timeout, this is the most important request
+	// Dedicated cart client — fast + reliable, this is the most important request
 	cartClient = &http.Client{
 		Timeout: CART_TIMEOUT,
 		Transport: &http.Transport{
-			MaxIdleConns:        10,
-			MaxIdleConnsPerHost: 5,
-			IdleConnTimeout:     120 * time.Second,
-			TLSHandshakeTimeout: 5 * time.Second,
-			ForceAttemptHTTP2:   true,
+			DialContext:           sharedDialer.DialContext,
+			MaxIdleConns:          15,
+			MaxIdleConnsPerHost:   10,
+			IdleConnTimeout:       180 * time.Second,
+			TLSHandshakeTimeout:   2 * time.Second,
+			ResponseHeaderTimeout: 8 * time.Second,
+			ForceAttemptHTTP2:     true,
+			WriteBufferSize:       4096,
+			ReadBufferSize:        4096,
 		},
 	}
 )
@@ -253,6 +272,9 @@ func addToCart(p Product) {
 	fullURL := constructFullURL(p)
 	overallStart := time.Now()
 
+	// Pre-build the payload string to avoid formatting overhead inside the loop (Optimization Item 2)
+	payloadStr := fmt.Sprintf(`{"ftk":%q,"viewid":"","productid":%q,"quantity":"1","offertype":"NO","offerid":"","action":"add","gcoffer":""}`, ftk, p.ProductID)
+
 	// --- ATTEMPT PRIMARY API (SaveCartDetail) WITH RETRIES ---
 	var lastErr error
 	var lastStatus int
@@ -261,15 +283,17 @@ func addToCart(p Product) {
 
 	for attempt := 1; attempt <= CART_MAX_RETRIES; attempt++ {
 		if attempt > 1 {
-			// Exponential backoff: 500ms, 1s, 2s
-			backoff := time.Duration(1<<(attempt-2)) * 500 * time.Millisecond
+			// Reduced backoff: 200ms, 500ms, 1s (was 500ms, 1s, 2s)
+			backoff := time.Duration(1<<(attempt-2)) * 200 * time.Millisecond
+			if backoff > 1*time.Second {
+				backoff = 1 * time.Second
+			}
 			log.Printf("🔄 Cart retry %d/%d in %v for: %s", attempt, CART_MAX_RETRIES, backoff, p.ProductName)
 			time.Sleep(backoff)
 		}
 
-		payload := fmt.Sprintf(`{"ftk":%q,"viewid":"","productid":%q,"quantity":"1","offertype":"NO","offerid":"","action":"add","gcoffer":""}`, ftk, p.ProductID)
-
-		req, err := http.NewRequest("POST", CART_API_URL, bytes.NewBufferString(payload))
+		// Use the pre-built payload string
+		req, err := http.NewRequest("POST", CART_API_URL, strings.NewReader(payloadStr))
 		if err != nil {
 			lastErr = fmt.Errorf("build request: %v", err)
 			continue
@@ -464,12 +488,29 @@ func constructFullURL(p Product) string {
 }
 
 func loadSeenItems() {
-	data, _ := os.ReadFile(SEEN_ITEMS_FILE)
+	data, err := os.ReadFile(SEEN_ITEMS_FILE)
+	if err != nil {
+		return
+	}
 	lines := strings.Split(string(data), "\n")
+	uniqueLines := []string{}
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
 		if line != "" {
-			seenItems[line] = true
+			if !seenItems[line] {
+				seenItems[line] = true
+				uniqueLines = append(uniqueLines, line)
+			}
+		}
+	}
+	
+	// Deduplicate on load to prevent the file from growing indefinitely (Optimization Item 10)
+	if len(uniqueLines) < len(lines) {
+		err = os.WriteFile(SEEN_ITEMS_FILE, []byte(strings.Join(uniqueLines, "\n")+"\n"), 0644)
+		if err != nil {
+			log.Printf("⚠️ Failed to write deduplicated seen items: %v", err)
+		} else {
+			log.Printf("🧹 Deduplicated seen items file (removed %d duplicates)", len(lines)-len(uniqueLines))
 		}
 	}
 }
@@ -890,8 +931,14 @@ startMonitoring:
 			copy(productsToCheck, restockWatchlist.Products)
 			restockWatchlistMu.RUnlock()
 
+			// Bounded concurrency — max RESTOCK_MAX_CONCURRENT simultaneous checks
+			sem := make(chan struct{}, RESTOCK_MAX_CONCURRENT)
 			for _, wp := range productsToCheck {
-				go checkRestockAndCart(wp)
+				sem <- struct{}{} // Acquire slot
+				go func(w WatchProduct) {
+					defer func() { <-sem }() // Release slot
+					checkRestockAndCart(w)
+				}(wp)
 			}
 		}
 	}
@@ -1152,9 +1199,18 @@ func commandListenerWorker(stop chan struct{}) {
 					newCookies := strings.Join(parts[1:], " ")
 					cartConfigMu.Lock()
 					cartConfig.Cookies = newCookies
+					// Auto-extract FC_AUTH as FTK — saves a separate /updateftk step
+					extractedFtk := extractFtkFromCookies(newCookies)
+					if extractedFtk != "" {
+						cartConfig.Ftk = extractedFtk
+					}
 					cartConfigMu.Unlock()
 					saveCartConfig()
-					sendTelegramMessage(ADMIN_CHAT_ID, "✅ Cart cookies updated.")
+					if extractedFtk != "" {
+						sendTelegramMessage(ADMIN_CHAT_ID, "✅ Cart cookies updated + FTK auto-extracted from FC_AUTH!")
+					} else {
+						sendTelegramMessage(ADMIN_CHAT_ID, "✅ Cart cookies updated. (⚠️ FC_AUTH not found — use /updateftk manually)")
+					}
 				} else {
 					sendTelegramMessage(ADMIN_CHAT_ID, "Usage: /updatecookies <cookie_string>")
 				}
@@ -1351,6 +1407,73 @@ func fullScanProducts() ([]Product, error) {
 	return allProducts, nil
 }
 
+// --- EXTRACT FTK FROM COOKIES ---
+func extractFtkFromCookies(cookies string) string {
+	// Look for FC_AUTH=<value> in the cookie string
+	for _, pair := range strings.Split(cookies, ";") {
+		pair = strings.TrimSpace(pair)
+		if strings.HasPrefix(pair, "FC_AUTH=") {
+			val := strings.TrimPrefix(pair, "FC_AUTH=")
+			// URL-decode if needed
+			if decoded, err := url.QueryUnescape(val); err == nil {
+				return decoded
+			}
+			return val
+		}
+	}
+	return ""
+}
+
+// --- PRE-WARM CONNECTIONS (eliminates cold-start latency) ---
+func preWarmConnections() {
+	log.Println("🔥 Pre-warming connections...")
+	var wg sync.WaitGroup
+
+	// Warm FirstCry API connection
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		req, _ := http.NewRequest("HEAD", "https://www.firstcry.com/", nil)
+		req.Header.Set("User-Agent", "Mozilla/5.0")
+		if resp, err := apiClient.Do(req); err == nil {
+			resp.Body.Close()
+			log.Println("  ✅ FirstCry API connection warmed")
+		} else {
+			log.Printf("  ⚠️ FirstCry warm failed (ok): %v", err)
+		}
+	}()
+
+	// Warm Cart API connection
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		req, _ := http.NewRequest("HEAD", "https://www.firstcry.com/svcs/CommonService.svc/", nil)
+		req.Header.Set("User-Agent", "Mozilla/5.0")
+		if resp, err := cartClient.Do(req); err == nil {
+			resp.Body.Close()
+			log.Println("  ✅ Cart API connection warmed")
+		} else {
+			log.Printf("  ⚠️ Cart warm failed (ok): %v", err)
+		}
+	}()
+
+	// Warm Telegram API connection
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		testURL := fmt.Sprintf("https://api.telegram.org/bot%s/getMe", TELEGRAM_BOT_TOKEN)
+		if resp, err := telegramClient.Get(testURL); err == nil {
+			resp.Body.Close()
+			log.Println("  ✅ Telegram API connection warmed")
+		} else {
+			log.Printf("  ⚠️ Telegram warm failed (ok): %v", err)
+		}
+	}()
+
+	wg.Wait()
+	log.Println("🔥 All connections pre-warmed!")
+}
+
 // --- KEEP-ALIVE ---
 func startKeepAlive() {
 	appURL := "https://hh-mvnn.onrender.com"
@@ -1374,11 +1497,14 @@ func startKeepAlive() {
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 	startTime = time.Now()
-	log.Println("--- ⚡ Hot Wheels Hunter TURBO v2 ⚡ ---")
-	log.Printf("Speed config: Ultra=%ds | Fast=10s | Full=%ds", int(ULTRA_FAST_INTERVAL.Seconds()), int(FULL_SCAN_INTERVAL.Seconds()))
+	log.Println("--- ⚡ Hot Wheels Hunter TURBO v3 ⚡ ---")
+	log.Printf("Speed config: Ultra=%ds | Fast=%ds | Full=%ds | Restock=%ds", int(ULTRA_FAST_INTERVAL.Seconds()), int(FAST_POLL_INTERVAL.Seconds()), int(FULL_SCAN_INTERVAL.Seconds()), int(RESTOCK_POLL_INTERVAL.Seconds()))
 
-	// 3 concurrent Telegram senders for max throughput
-	for i := 0; i < 3; i++ {
+	// Pre-warm all connections before anything starts
+	preWarmConnections()
+
+	// 5 concurrent Telegram senders for max throughput (was 3)
+	for i := 0; i < 5; i++ {
 		go telegramSenderWorker()
 	}
 
@@ -1391,7 +1517,7 @@ func main() {
 
 		http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusOK)
-			w.Write([]byte("⚡ Hot Wheels Hunter TURBO v2 is running! ⚡"))
+			w.Write([]byte("⚡ Hot Wheels Hunter TURBO v3 is running! ⚡"))
 		})
 
 		http.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
@@ -1418,7 +1544,7 @@ func main() {
 				"skipped_checks": %d,
 				"new_items_found": %d,
 				"uptime": "%s",
-				"bot": "Hot Wheels Hunter TURBO v2",
+				"bot": "Hot Wheels Hunter TURBO v3",
 				"timestamp": "%s"
 			}`, status, uInterval.Seconds(), sInterval.Seconds(), itemCount,
 				checks, skipped, newItems, uptime.String(),
@@ -1464,8 +1590,8 @@ func main() {
 	restockWatchlistMu.RUnlock()
 
 	sendTelegramMessage(ADMIN_CHAT_ID, fmt.Sprintf(
-		"⚡ <b>Bot TURBO v2 Online!</b>\n\nUltra-fast: every %ds (5 items)\nFast: every 10s (20 items)\nFull scan: every %ds (all pages)\n👁️ Restock monitor: %s\n\n🔥 ETag caching + content-hash dedup active",
-		int(ULTRA_FAST_INTERVAL.Seconds()), int(FULL_SCAN_INTERVAL.Seconds()), restockStatus))
+		"⚡ <b>Bot TURBO v3 Online!</b>\n\nUltra-fast: every %ds (5 items)\nFast: every %ds (20 items)\nFull scan: every %ds (all pages)\n👁️ Restock monitor: %s\n\n🔥 Pre-warmed + Aggressive Keep-Alive + Auto-FTK active",
+		int(ULTRA_FAST_INTERVAL.Seconds()), int(FAST_POLL_INTERVAL.Seconds()), int(FULL_SCAN_INTERVAL.Seconds()), restockStatus))
 
 	<-stop
 	log.Println("--- Bot shut down. ---")
